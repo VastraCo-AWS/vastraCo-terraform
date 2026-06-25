@@ -1,0 +1,28 @@
+# Terraform local state & lock files
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+
+# Terraform plan artifacts (uploaded to GitHub as workflow artifacts instead)
+tfplan
+tfplan.*
+*.tfplan
+tfplan.txt
+apply.log
+
+# Terraform variable files that may contain sensitive values
+*.auto.tfvars
+terraform.tfvars.local
+
+# Script-generated outputs (contains ARNs — do not commit)
+scripts/.aws-setup-outputs.env
+
+# macOS
+.DS_Store
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp

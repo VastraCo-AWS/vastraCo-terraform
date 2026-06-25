@@ -1,0 +1,559 @@
+name: VastraCo Infrastructure CI/CD
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Triggers
+# ──────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'terraform/**'
+      - 'bootstrap/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'terraform/**'
+      - 'bootstrap/**'
+  workflow_dispatch:
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Permissions (OIDC + PR comment support)
+# ──────────────────────────────────────────────────────────────────────────────
+permissions:
+  id-token: write        # Required for OIDC federation with AWS
+  contents: read
+  pull-requests: write   # Required to post plan comments
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Concurrency — prevent overlapping runs on the same branch/PR
+# If a newer run starts, cancel the older in-progress run.
+# ──────────────────────────────────────────────────────────────────────────────
+concurrency:
+  group: vastraco-infra-${{ github.ref }}
+  cancel-in-progress: true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Global environment — Terraform variable injection via TF_VAR_*
+# Add additional TF_VAR_* entries here or in job-level env blocks.
+# ──────────────────────────────────────────────────────────────────────────────
+env:
+  TF_VAR_alert_email:    ${{ secrets.ALERT_EMAIL }}
+  TF_VAR_domain_name:    ${{ vars.DOMAIN_NAME }}
+  TF_VAR_aws_region:     ${{ vars.AWS_REGION }}
+  TF_INPUT:              "false"    # Never prompt for input in CI
+  TF_IN_AUTOMATION:      "true"     # Suppress interactive guidance messages
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Job 1: Detect which directories changed
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+  detect-changes:
+    name: Detect Changed Paths
+    runs-on: ubuntu-latest
+    outputs:
+      bootstrap: ${{ steps.filter.outputs.bootstrap }}
+      terraform: ${{ steps.filter.outputs.terraform }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # On workflow_dispatch there is no base commit to diff against.
+      # We treat manual triggers as if both directories changed so all
+      # downstream jobs run.
+      - name: Override filters for manual dispatch
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "DISPATCH_BOOTSTRAP=true"  >> $GITHUB_ENV
+          echo "DISPATCH_TERRAFORM=true"  >> $GITHUB_ENV
+
+      - name: Filter Paths
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # For push/PR events this diffs the commit range.
+          # For workflow_dispatch the env overrides above are used in
+          # downstream if-conditions directly, so outputs here don't matter.
+          filters: |
+            bootstrap:
+              - 'bootstrap/**'
+            terraform:
+              - 'terraform/**'
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 2: Bootstrap CI (only when bootstrap/** changes)
+  # ────────────────────────────────────────────────────────────────────────────
+  bootstrap-ci:
+    name: Bootstrap Validate
+    needs: detect-changes
+    if: |
+      needs.detect-changes.outputs.bootstrap == 'true' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./bootstrap
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          # ── Fallback: static credentials (use only if OIDC is not configured) ──
+          # aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          # aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ">= 1.5.0"
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan (bootstrap — informational only)
+        run: terraform plan -no-color
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 3: Terraform Plan
+  # ────────────────────────────────────────────────────────────────────────────
+  terraform-plan:
+    name: Terraform Plan
+    needs: detect-changes
+    if: |
+      needs.detect-changes.outputs.terraform == 'true' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ── AWS Authentication via OIDC ─────────────────────────────────────────
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          # ── Fallback: static credentials (use only if OIDC is not configured) ──
+          # aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          # aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # ── Terraform Setup ─────────────────────────────────────────────────────
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ">= 1.5.0"
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      # ── Security & Quality Scanning ─────────────────────────────────────────
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      # Write inline plugin config so TFLint can validate AWS-specific rules.
+      # This is separate from the project's own .tflint.hcl (if any).
+      - name: Write TFLint Config
+        run: |
+          cat > /tmp/.tflint.hcl <<'EOF'
+          plugin "aws" {
+            enabled = true
+            version = "0.32.0"
+            source  = "github.com/terraform-linters/tflint-ruleset-aws"
+          }
+          EOF
+
+      - name: Init TFLint (download AWS ruleset)
+        run: tflint --init --config /tmp/.tflint.hcl
+
+      - name: Run TFLint
+        run: tflint -f compact --config /tmp/.tflint.hcl
+        continue-on-error: false
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: ./terraform
+          additional_args: >-
+            --minimum-severity HIGH
+            --no-color
+            --format lovely
+
+      - name: Run Trivy IaC Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: config
+          scan-ref: terraform
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          format: table
+
+      # ── Generate & Upload Plan ──────────────────────────────────────────────
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -out=tfplan
+        # Capture exit codes:
+        #   0 = no changes
+        #   1 = error
+        #   2 = changes present
+        continue-on-error: false
+
+      - name: Export Plan as Human-Readable Text
+        run: terraform show -no-color tfplan > tfplan.txt
+
+      # ── Publish Plan to GitHub Step Summary ────────────────────────────────
+
+      - name: Publish Plan to Step Summary
+        if: always() && steps.plan.outcome != 'skipped'
+        run: |
+          {
+            echo "### Terraform Plan — \`${{ github.ref_name }}\` @ \`${GITHUB_SHA:0:7}\`"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Event | \`${{ github.event_name }}\` |"
+            echo "| Actor | \`${{ github.actor }}\` |"
+            echo "| Branch | \`${{ github.ref_name }}\` |"
+            echo "| Commit | \`${GITHUB_SHA:0:7}\` |"
+            echo ""
+            echo "<details><summary>View Full Plan Output</summary>"
+            echo ""
+            echo '```hcl'
+            cat tfplan.txt
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Post Plan Comment to Pull Request ───────────────────────────────────
+
+      - name: Post Plan to Pull Request
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request' && steps.plan.outcome == 'success'
+        env:
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs   = require('fs');
+            const path = require('path');
+
+            // tfplan.txt is written to ./terraform/ by the run steps above.
+            // In github-script the CWD is the workspace root, so we need the
+            // full relative path from the workspace root.
+            const planPath = path.join(process.env.GITHUB_WORKSPACE, 'terraform', 'tfplan.txt');
+            const plan     = fs.existsSync(planPath)
+              ? fs.readFileSync(planPath, 'utf8').substring(0, 60000)  // GitHub comment cap
+              : 'Plan output not available.';
+
+            const sha7 = context.sha.substring(0, 7);
+            const body = [
+              `### Terraform Plan — \`${context.ref.replace('refs/heads/', '')}\` @ \`${sha7}\``,
+              '',
+              `| Field  | Value |`,
+              `|--------|-------|`,
+              `| Actor  | \`${context.actor}\` |`,
+              `| Commit | \`${sha7}\` |`,
+              `| Status | Plan succeeded |`,
+              '',
+              '<details>',
+              '<summary>Click to expand full plan output</summary>',
+              '',
+              '```hcl',
+              plan,
+              '```',
+              '',
+              '</details>',
+              '',
+              '> Approve this PR to trigger the `terraform-apply` job via the `production-infra` environment gate.',
+            ].join('\n');
+
+            // Delete any previous bot comment on this PR to keep it clean.
+            const comments = await github.rest.issues.listComments({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            for (const c of comments.data) {
+              if (c.user.type === 'Bot' && c.body.includes('Terraform Plan')) {
+                await github.rest.issues.deleteComment({
+                  owner:      context.repo.owner,
+                  repo:       context.repo.repo,
+                  comment_id: c.id,
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      # ── Upload Plan Artifact ────────────────────────────────────────────────
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}-${{ github.run_attempt }}
+          # Path is relative to GITHUB_WORKSPACE (repo root).
+          # The working-directory default applies only to `run` steps.
+          path: terraform/tfplan
+          retention-days: 7
+          if-no-files-found: error
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 4: Terraform Apply
+  # Runs only on push to main/develop (never on PRs).
+  # Gated behind the `production-infra` GitHub Environment for manual approval.
+  # Applies the EXACT tfplan artifact from the plan job — no new plan generated.
+  # ────────────────────────────────────────────────────────────────────────────
+  terraform-apply:
+    name: Terraform Apply
+    needs: [detect-changes, terraform-plan]
+    if: |
+      (
+        needs.detect-changes.outputs.terraform == 'true' ||
+        github.event_name == 'workflow_dispatch'
+      ) &&
+      github.event_name != 'pull_request' &&
+      (
+        github.ref == 'refs/heads/main' ||
+        github.ref == 'refs/heads/develop'
+      )
+    runs-on: ubuntu-latest
+    environment: production-infra     # <-- triggers manual approval gate
+    defaults:
+      run:
+        working-directory: ./terraform
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          # ── Fallback: static credentials (use only if OIDC is not configured) ──
+          # aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          # aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ">= 1.5.0"
+
+      # Download the EXACT plan produced and reviewed in the plan job.
+      # This guarantees that what was reviewed is what gets applied.
+      - name: Download Approved Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: terraform
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Apply Approved Plan
+        id: apply
+        run: |
+          terraform apply -auto-approve tfplan 2>&1 | tee apply.log
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish Apply Summary
+        if: always() && steps.apply.outcome != 'skipped'
+        run: |
+          {
+            echo "### Terraform Apply — \`${{ github.ref_name }}\` @ \`${GITHUB_SHA:0:7}\`"
+            echo ""
+            echo "| Field  | Value |"
+            echo "|--------|-------|"
+            echo "| Result | \`${{ steps.apply.outcome }}\` |"
+            echo "| Actor  | \`${{ github.actor }}\` |"
+            echo "| Commit | \`${GITHUB_SHA:0:7}\` |"
+            echo "| Env    | \`production-infra\` |"
+            echo ""
+            echo "<details><summary>View Apply Log</summary>"
+            echo ""
+            echo '```'
+            tail -200 apply.log
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Apply Logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: apply-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: terraform/apply.log
+          retention-days: 30      # Extended retention for audit trail
+          if-no-files-found: warn
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 5: Notifications
+  # Always runs regardless of upstream job outcomes.
+  # Skipped jobs are not treated as failures.
+  # ────────────────────────────────────────────────────────────────────────────
+  notify:
+    name: Workflow Notifications
+    needs: [detect-changes, bootstrap-ci, terraform-plan, terraform-apply]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine Overall Status
+        id: status
+        run: |
+          # Map each result to a severity score.
+          # 'skipped' is not a failure — it means the job was not applicable.
+          score() {
+            case "$1" in
+              failure|cancelled) echo 2 ;;
+              success)           echo 0 ;;
+              skipped)           echo 0 ;;
+              *)                 echo 1 ;;
+            esac
+          }
+
+          BOOTSTRAP_SCORE=$(score "${{ needs.bootstrap-ci.result }}")
+          PLAN_SCORE=$(score "${{ needs.terraform-plan.result }}")
+          APPLY_SCORE=$(score "${{ needs.terraform-apply.result }}")
+
+          TOTAL=$((BOOTSTRAP_SCORE + PLAN_SCORE + APPLY_SCORE))
+
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "overall_status=FAILURE" >> "$GITHUB_OUTPUT"
+          else
+            echo "overall_status=SUCCESS" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Produce a human-readable job matrix for the email body.
+          cat <<EOF >> "$GITHUB_OUTPUT"
+          job_matrix<<MATRIX
+          Bootstrap CI  : ${{ needs.bootstrap-ci.result }}
+          Terraform Plan: ${{ needs.terraform-plan.result }}
+          Terraform Apply: ${{ needs.terraform-apply.result }}
+          MATRIX
+          EOF
+
+      # ── Success Email ────────────────────────────────────────────────────────
+
+      - name: Send Success Email
+        if: steps.status.outputs.overall_status == 'SUCCESS'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          to: ${{ secrets.EMAIL_TO }}
+          from: VastraCo CI/CD <${{ secrets.EMAIL_USERNAME }}>
+          subject: "[VastraCo] Infrastructure Pipeline SUCCESS — ${{ github.ref_name }} @ ${{ github.sha && github.sha || 'N/A' }}"
+          body: |
+            ============================================================
+              VastraCo — Infrastructure Pipeline Notification
+            ============================================================
+
+            Status      : SUCCESS
+            Workflow    : ${{ github.workflow }}
+            Environment : production-infra
+            Branch      : ${{ github.ref_name }}
+            Commit SHA  : ${{ github.sha }}
+            Triggered By: ${{ github.actor }}
+            Event       : ${{ github.event_name }}
+            Timestamp   : ${{ github.event.head_commit.timestamp || 'Manual Execution' }}
+
+            ------------------------------------------------------------
+            Job Results
+            ------------------------------------------------------------
+            ${{ steps.status.outputs.job_matrix }}
+
+            ------------------------------------------------------------
+            All applicable pipeline stages completed successfully.
+
+            View Workflow Run:
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            ============================================================
+            This is an automated message from VastraCo CI/CD.
+            Do not reply to this email.
+
+      # ── Failure Email ────────────────────────────────────────────────────────
+
+      - name: Send Failure Email
+        if: steps.status.outputs.overall_status == 'FAILURE'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          to: ${{ secrets.EMAIL_TO }}
+          from: VastraCo CI/CD <${{ secrets.EMAIL_USERNAME }}>
+          subject: "[VastraCo] Infrastructure Pipeline FAILURE — ${{ github.ref_name }} @ ${{ github.sha }}"
+          body: |
+            ============================================================
+              VastraCo — Infrastructure Pipeline Notification
+            ============================================================
+
+            Status      : FAILURE  <<< ACTION REQUIRED
+            Workflow    : ${{ github.workflow }}
+            Environment : production-infra
+            Branch      : ${{ github.ref_name }}
+            Commit SHA  : ${{ github.sha }}
+            Triggered By: ${{ github.actor }}
+            Event       : ${{ github.event_name }}
+            Timestamp   : ${{ github.event.head_commit.timestamp || 'Manual / API Execution' }}
+
+            ------------------------------------------------------------
+            Job Results
+            ------------------------------------------------------------
+            ${{ steps.status.outputs.job_matrix }}
+
+            ------------------------------------------------------------
+            ACTION REQUIRED
+            ------------------------------------------------------------
+            The infrastructure pipeline failed.
+
+            Common failure causes:
+            - Terraform syntax or validation errors
+            - tfsec / Trivy detected HIGH or CRITICAL findings
+            - AWS authentication failure (check OIDC role trust policy)
+            - Terraform apply error (resource constraint or API error)
+
+            Investigate and resolve before the next merge to main.
+
+            View Workflow Logs:
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            ============================================================
+            This is an automated message from VastraCo CI/CD.
+            Do not reply to this email.
